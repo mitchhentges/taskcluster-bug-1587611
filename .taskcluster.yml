@@ -1,0 +1,182 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+---
+version: 1
+reporting: checks-v1
+policy:
+    # XXX We restrict taskcluster to collaborators so privileged tests (like UI tests) can run on PRs
+    pullRequests: collaborators
+tasks:
+    - $let:
+          taskgraph:
+              branch: taskgraph
+              revision: 0c5a68749f9a7672a7e56604b69a7bd41b036614
+          trustDomain: app-services
+      in:
+          $let:
+              # Github events have this stuff in different places...
+              ownerEmail:
+                  $if: 'tasks_for == "github-push"'
+                  then: '${event.pusher.email}'
+                  else:
+                      $if: 'tasks_for == "github-pull-request"'
+                      then: '${event.pull_request.user.login}@users.noreply.github.com'
+                      else:
+                          $if: 'tasks_for == "github-release"'
+                          then: '${event.sender.login}@users.noreply.github.com'
+              baseRepoUrl:
+                  $if: 'tasks_for in ["github-push", "github-release"]'
+                  then: '${event.repository.html_url}'
+                  else:
+                      $if: 'tasks_for == "github-pull-request"'
+                      then: '${event.pull_request.base.repo.html_url}'
+              repoUrl:
+                  $if: 'tasks_for in ["github-push", "github-release"]'
+                  then: '${event.repository.html_url}'
+                  else:
+                      $if: 'tasks_for == "github-pull-request"'
+                      then: '${event.pull_request.head.repo.html_url}'
+              project:
+                  $if: 'tasks_for in ["github-push", "github-release"]'
+                  then: '${event.repository.name}'
+                  else:
+                      $if: 'tasks_for == "github-pull-request"'
+                      then: '${event.pull_request.head.repo.name}'
+              head_branch:
+                  $if: 'tasks_for == "github-pull-request"'
+                  then: ${event.pull_request.head.ref}
+                  else:
+                      $if: 'tasks_for == "github-push"'
+                      then: ${event.ref}
+                      else:
+                          $if: 'tasks_for == "github-release"'
+                          then: '${event.release.target_commitish}'
+              head_sha:
+                  $if: 'tasks_for == "github-push"'
+                  then: '${event.after}'
+                  else:
+                      $if: 'tasks_for == "github-pull-request"'
+                      then: '${event.pull_request.head.sha}'
+                      else:
+                          $if: 'tasks_for == "github-release"'
+                          then: '${event.release.tag_name}'
+              ownTaskId: {$eval: as_slugid("decision_task")}
+          in:
+              # filter for github events that we will run taskgraph for
+              $if: 'tasks_for == "github-pull-request" || (tasks_for == "github-push" && head_branch[:10] != "refs/tags/") || (tasks_for == "github-release" && event["action"] == "published")'
+              then:
+                  $let:
+                      level: '1'
+                  in:
+                      taskId: '${ownTaskId}'
+                      taskGroupId: '${ownTaskId}'  # same as taskId; this is how automation identifies a decision task
+                      schedulerId: '${trustDomain}-level-${level}'
+                      created: {$fromNow: ''}
+                      deadline: {$fromNow: '1 day'}
+                      expires: {$fromNow: '1 year 1 second'}  # 1 second so artifacts expire first, despite rounding errors
+                      metadata:
+                          $merge:
+                              - owner: "${ownerEmail}"
+                                source: '${repoUrl}/raw/${head_sha}/.taskcluster.yml'
+                              - $if: 'tasks_for in ["github-push", "github-pull-request", "github-release"]'
+                                then:
+                                    name: "Decision Task"
+                                    description: 'The task that creates all of the other tasks in the task graph'
+                      provisionerId: "aws-provisioner-v1"
+                      workerType: "app-services-${level}-decision"
+                      tags:
+                          kind: decision-task
+                      routes:
+                          - checks
+                      scopes:
+                          # `https://` is 8 characters so, ${repoUrl[8:]} is the repository without the protocol.
+                          $if: 'tasks_for == "github-push"'
+                          then:
+                              $let:
+                                  short_head_branch:
+                                      $if: 'head_branch[:11] == "refs/heads/"'
+                                      then: {$eval: 'head_branch[11:]'}
+                                      else: ${head_branch}
+                              in:
+                                  - 'assume:repo:${repoUrl[8:]}:branch:${short_head_branch}'
+                          else:
+                              $if: 'tasks_for == "github-pull-request"'
+                              then:
+                                  - 'assume:repo:github.com/${event.pull_request.base.repo.full_name}:pull-request'
+                              else:
+                                  $if: 'tasks_for == "github-release"'
+                                  then:
+                                      - 'assume:repo:${repoUrl[8:]}:release'
+
+                      requires: all-completed
+                      priority: lowest
+                      retries: 5
+
+                      payload:
+                          env:
+                              # run-task uses these to check out the source; the inputs
+                              # to `mach taskgraph decision` are all on the command line.
+                              $merge:
+                                  - MOZILLA_BASE_REPOSITORY: '${baseRepoUrl}'
+                                    MOZILLA_HEAD_REPOSITORY: '${repoUrl}'
+                                    MOZILLA_HEAD_REF: '${head_branch}'
+                                    MOZILLA_HEAD_REV: '${head_sha}'
+                                    MOZILLA_REPOSITORY_TYPE: git
+                                    TASKGRAPH_BASE_REPOSITORY: https://hg.mozilla.org/ci/taskgraph
+                                    TASKGRAPH_HEAD_REPOSITORY: https://hg.mozilla.org/ci/${taskgraph.branch}
+                                    TASKGRAPH_HEAD_REV: ${taskgraph.revision}
+                                    TASKGRAPH_REPOSITORY_TYPE: hg
+                                    REPOSITORIES: {$json: {mozilla: "Taskcluster Bug 1587611", taskgraph: "Taskgraph"}}
+                                    HG_STORE_PATH: /builds/worker/checkouts/hg-store
+                                    ANDROID_SDK_ROOT: /builds/worker/android-sdk
+                                  - $if: 'tasks_for in ["github-pull-request"]'
+                                    then:
+                                        MOZILLA_PULL_REQUEST_NUMBER: '${event.pull_request.number}'
+                                  - $if: 'tasks_for == "github-release"'
+                                    then:
+                                        MOZILLA_HEAD_TAG: '${event.release.tag_name}'
+                          features:
+                              taskclusterProxy: true
+                              chainOfTrust: true
+                          # Note: This task is built server side without the context or tooling that
+                          # exist in tree so we must hard code the hash
+                          image:
+                              mozillareleases/taskgraph:decision-mobile-6020473b1a928d8df50e234a7ca2e81ade2220a4fb5fbe16b02477dd64a49728@sha256:98d226736b7d03907114bf37938002b90e8a37cbe3a297690e349f1ddddb1d7c
+
+                          maxRunTime: 1800
+                          command:
+                              - /usr/local/bin/run-task
+                              - '--mozilla-checkout=/builds/worker/checkouts/src'
+                              - '--taskgraph-checkout=/builds/worker/checkouts/taskgraph'
+                              - '--task-cwd=/builds/worker/checkouts/src'
+                              - '--'
+                              - bash
+                              - -cx
+                              - >
+                                PIP_IGNORE_INSTALLED=0 pip install --user /builds/worker/checkouts/taskgraph &&
+                                PIP_IGNORE_INSTALLED=0 pip install --user arrow taskcluster pyyaml &&
+                                ln -s /builds/worker/artifacts artifacts &&
+                                ~/.local/bin/taskgraph decision
+                                --pushlog-id='0'
+                                --pushdate='0'
+                                --project='${project}'
+                                --message=""
+                                --owner='${ownerEmail}'
+                                --level='${level}'
+                                --base-repository="$MOZILLA_BASE_REPOSITORY"
+                                --head-repository="$MOZILLA_HEAD_REPOSITORY"
+                                --head-ref="$MOZILLA_HEAD_REF"
+                                --head-rev="$MOZILLA_HEAD_REV"
+                                --repository-type="$MOZILLA_REPOSITORY_TYPE"
+                                --tasks-for='${tasks_for}'
+
+                          artifacts:
+                              'public':
+                                  type: 'directory'
+                                  path: '/builds/worker/artifacts'
+                                  expires: {$fromNow: '1 year'}
+
+                      extra:
+                          $merge:
+                              - tasks_for: '${tasks_for}'

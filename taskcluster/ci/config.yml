@@ -1,0 +1,26 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+---
+trust-domain: app-services
+task-priority: highest
+
+taskgraph:
+  register: bug_1587611_taskgraph:register
+  repositories:
+    appservices:
+      name: "Taskcluster Bug 1587611"
+  cached-task-prefix: project.mozilla.bug-1587611
+
+workers:
+  aliases:
+    b-linux:
+      provisioner: aws-provisioner-v1
+      implementation: docker-worker
+      os: linux
+      worker-type: 'app-services-{level}-b-linux'
+    images:
+      provisioner: aws-provisioner-v1
+      implementation: docker-worker
+      os: linux
+      worker-type: 'app-services-{level}-images'
